@@ -103,7 +103,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.0"
+#define HP_MPG_VERSION "3.2.1"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -290,6 +290,11 @@ static zend_op_array *hp_upg_compile_file(zend_file_handle *file_handle, int typ
 }
 #endif
 
+#if PHP_VERSION_ID >= 80200
+static int hp_upg_sxe_wanted;
+static void hp_upg_sxe_hook(void);
+#endif
+
 static PHP_RINIT_FUNCTION(hp_uploadprogress_guard)
 {
 #if defined(ZTS) && PHP_VERSION_ID >= 70000
@@ -302,6 +307,11 @@ static PHP_RINIT_FUNCTION(hp_uploadprogress_guard)
 		hp_upg_compile_hooked = 1;
 	}
 	hp_upg_restore_limit();
+#endif
+#if PHP_VERSION_ID >= 80200
+	if (hp_upg_sxe_wanted) {
+		hp_upg_sxe_hook();
+	}
 #endif
 	return SUCCESS;
 }
@@ -684,12 +694,101 @@ static void hp_upg_unhook_unserialize(void)
 	hp_upg_unser_hooked = 0;
 }
 
+/* ---- SimpleXML GC double free (php-src#24488) ----
+ * The fixed releases add the table an object's get_gc returns to the GC buffer. SimpleXML's get_gc returns
+ * its own properties table, and sxe_object_free_storage() frees that table with zend_hash_release(), which
+ * does not take it out of the buffer: the GC then frees it a second time. The upstream fix releases it with
+ * zend_array_release() instead. Here SimpleXML's free_obj handler is wrapped to do exactly that: the table is
+ * taken off the object, SimpleXML frees the rest (finding nothing to release), and the table is released with
+ * zend_array_release(). php_sxe_object starts with node, document, properties (all pointers) and the handler
+ * table's offset is that of the embedded zend_object. Installed on the first request (objects cannot be
+ * created at startup), on the affected releases only; harmless once the upstream fix is in. */
+#if PHP_VERSION_ID >= 80200
+static zend_object_handlers *hp_upg_sxe_handlers = NULL;
+static void (*hp_upg_sxe_orig_free)(zend_object *object) = NULL;
+static int hp_upg_sxe_wanted = 0;
+static int hp_upg_sxe_hooked = 0;
+#ifdef ZTS
+static volatile long hp_upg_sxe_once = 0; /* threads may enter RINIT together: only one may install the hook */
+#endif
+
+static void hp_upg_sxe_free_obj(zend_object *object)
+{
+	HashTable **slot = (HashTable **) ((char *) object - object->handlers->offset + 2 * sizeof(void *));
+	HashTable *props = *slot;
+
+	*slot = NULL;
+	hp_upg_sxe_orig_free(object);
+	if (props) {
+		zend_array_release(props);
+	}
+}
+
+static void hp_upg_sxe_hook(void)
+{
+	zend_class_entry *ce = zend_hash_str_find_ptr(CG(class_table), "simplexmlelement", sizeof("simplexmlelement") - 1);
+	zend_object *probe;
+
+#ifdef ZTS
+#ifdef _MSC_VER
+	if (InterlockedExchange((volatile LONG *) &hp_upg_sxe_once, 1)) {
+		return;
+	}
+#else
+	if (__sync_lock_test_and_set(&hp_upg_sxe_once, 1)) {
+		return;
+	}
+#endif
+#endif
+	hp_upg_sxe_wanted = 0; /* one attempt per process */
+	if (!ce || !ce->create_object) {
+		return;
+	}
+	probe = ce->create_object(ce);
+	if (!probe) {
+		return;
+	}
+	hp_upg_sxe_handlers = (zend_object_handlers *) probe->handlers;
+	OBJ_RELEASE(probe);
+	if (!hp_upg_sxe_handlers || !hp_upg_sxe_handlers->free_obj || hp_upg_sxe_handlers->offset < (int) (3 * sizeof(void *))) {
+		hp_upg_sxe_handlers = NULL;
+		return;
+	}
+	hp_upg_sxe_orig_free = hp_upg_sxe_handlers->free_obj;
+	hp_upg_sxe_handlers->free_obj = hp_upg_sxe_free_obj;
+	hp_upg_sxe_hooked = 1;
+}
+
+static void hp_upg_sxe_unhook(void)
+{
+	if (hp_upg_sxe_hooked && hp_upg_sxe_handlers && hp_upg_sxe_handlers->free_obj == hp_upg_sxe_free_obj) {
+		hp_upg_sxe_handlers->free_obj = hp_upg_sxe_orig_free;
+	}
+	hp_upg_sxe_hooked = 0;
+}
+#endif
+
+#if PHP_VERSION_ID >= 80200
+/* Releases carrying the GC change of GH-24050 (php-src#24488): 8.4.27 and 8.5.12 onward until fixed. */
+static int hp_upg_sxe_affected(void)
+{
+	if (strncmp(hp_upg_php_version, "8.4.", 4) == 0) {
+		return php_version_compare(hp_upg_php_version, "8.4.27") >= 0;
+	}
+	if (strncmp(hp_upg_php_version, "8.5.", 4) == 0) {
+		return php_version_compare(hp_upg_php_version, "8.5.12") >= 0;
+	}
+	return 0;
+}
+#endif
+
 PHP_INI_BEGIN()
 	PHP_INI_ENTRY("hp_uploadprogress_guard.mode", "parse", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.allow_ips", "", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.detach_upload_progress", "1", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.force_unlimited_memory", "0", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.unserialize_isolation", "1", PHP_INI_SYSTEM, NULL)
+	PHP_INI_ENTRY("hp_uploadprogress_guard.simplexml_gc_fix", "1", PHP_INI_SYSTEM, NULL)
 PHP_INI_END()
 
 static int hp_upg_client_allowed(void)
@@ -806,12 +905,20 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 	if (INI_BOOL("hp_uploadprogress_guard.unserialize_isolation")) {
 		hp_upg_hook_unserialize(HP_UPG_TSRMLS_C);
 	}
+#if PHP_VERSION_ID >= 80200
+	if (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") && hp_upg_sxe_affected()) {
+		hp_upg_sxe_wanted = 1;
+	}
+#endif
 	return SUCCESS;
 }
 
 static PHP_MSHUTDOWN_FUNCTION(hp_uploadprogress_guard)
 {
 	hp_upg_unhook_unserialize();
+#if PHP_VERSION_ID >= 80200
+	hp_upg_sxe_unhook();
+#endif
 	hp_upg_remove_oom_hook();
 	if (hp_upg_sapi_wrapped && sapi_module.deactivate == hp_upg_sapi_deactivate) {
 		sapi_module.deactivate = hp_upg_orig_sapi_deactivate;
@@ -861,6 +968,11 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 		}
 		php_info_print_table_row(2, "memory_limit forced to -1 (unlimited) and locked", row);
 	}
+#if PHP_VERSION_ID >= 80200
+	php_info_print_table_row(2, "SimpleXML GC double-free workaround (php-src#24488)", hp_upg_sxe_hooked ? "active"
+		: (hp_upg_sxe_wanted ? "pending (installed on first request)"
+		: (hp_upg_sxe_affected() ? (INI_BOOL("hp_uploadprogress_guard.simplexml_gc_fix") ? "n/a (SimpleXML not loaded)" : "off") : "not needed (this PHP release)")));
+#endif
 	php_info_print_table_row(2, "unserialize() re-entrancy isolation (destructors during var_destroy)", hp_upg_unser_hooked ? (hp_upg_sdecode_fn ? "active (unserialize, session_decode)" : "active (unserialize)") : "off");
 	php_info_print_table_end();
 	DISPLAY_INI_ENTRIES();

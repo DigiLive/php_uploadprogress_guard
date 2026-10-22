@@ -1,28 +1,37 @@
 # hp_uploadprogress_guard
 
-**v3.2.0, 22 October 2026: protection PHP itself does not ship yet.** Every current PHP release,
-8.5.12, 8.4.27, 8.3.36 and 8.2.35 included, still contains a use-after-free in `unserialize()`: when
-`var_destroy()` cleans up after an unserialization, it frees its bookkeeping first and then runs object
-destructors, and a destructor that calls `unserialize()` again works on that freed memory. This is the bug
-behind the "PHP 8.5.12 patch is incomplete" claims of 21 and 22 October, reported to PHP as
-[php/php-src#24481](https://github.com/php/php-src/issues/24481). PHP has not fixed it, and it has no CVE:
-PHP does not assign CVEs to memory bugs reachable through `unserialize()` of untrusted data.
-**v3.2.0 closes it.** A nested `unserialize()` or `session_decode()` that runs from a destructor, a
-generator or anywhere outside PHP's own `Serializable` nesting now gets fresh state of its own instead of the
-freed one. Verified with Valgrind on 8.5.12, 8.4.27, 8.3.36, 8.2.35 and 7.4.33: without the module every reproducer reads
-freed memory, with v3.2.0 none does, and PHP's own serialize and session test suites give the same results
-as before. The bug needs `unserialize()` of attacker-controlled data, or code already running on the host;
-where either is possible, it is a real hole, and this is the fix for it today. Unlike the php2shell layers,
-this protection stays active on patched PHP: **keep the module installed after you upgrade.**
+**v3.2.1, 22 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
+more problems have surfaced in current PHP. This module now covers both, on patched and unpatched PHP alike,
+so **keep it installed after you upgrade.**
 
-**v3.1.0, 21 October 2026.** A small PHP extension that mirrors the official fix for
+* **`unserialize()` use-after-free, in every current release.** When `unserialize()` cleans up, it frees its
+  bookkeeping first and then runs object destructors; a destructor that calls `unserialize()` again works on
+  freed memory. This is the bug behind the "PHP 8.5.12 patch is incomplete" claims. Present in 8.5.12,
+  8.4.27, 8.3.36, 8.2.35 and older; reachable when an application unserializes attacker-controlled data, or
+  by code already running on the host. Not fixed in any PHP release, no CVE (PHP does not assign CVEs to
+  `unserialize()` bugs): [php-src#24481](https://github.com/php/php-src/issues/24481).
+  **Closed by the module since v3.2.0**: such nested calls get their own state. Verified with Valgrind on all
+  five releases named here: freed-memory reads without the module, none with it.
+* **SimpleXML crashes, introduced by 8.4.27 and 8.5.12.** The security release changed the garbage collector,
+  and SimpleXML now frees its property table twice when an object converted with `json_encode()`, `(array)`
+  or `get_object_vars()` (the everyday `json_decode(json_encode($xml), true)`) is collected in a reference
+  cycle: `zend_mm_heap corrupted`, a crashed worker. Fix approved by PHP, not released yet:
+  [php-src#24488](https://github.com/php/php-src/issues/24488).
+  **Fixed by the module since v3.2.1**, by applying PHP's approved fix from inside the module, only on those
+  two releases. On a staging host with 8.4.27, a plain SimpleXML script crashed before and completed after.
+
+Nothing changes for applications: identical output with and without the module on every branch from 5.4 to
+8.5, and PHP's own serialize, session and SimpleXML test suites give the same results. Details and tests
+further down.
+
+**What it is.** A small PHP extension that mirrors the official fix for
 CVE-2026-109618 / CVE-2026-109619 component by component, so that on an unpatched PHP every link of
 the published attack chain is removed, without rebuilding PHP and without changing anything for the
 applications on the host. Built by [Hosted Power](https://www.hosted-power.com) for its own fleet,
 published for everyone. PHP 5.4 through 8.5; Sury, Remi, cPanel EA4, DirectAdmin CustomBuild, official
 Docker images. **Prebuilt for Linux x86_64 and arm64 (aarch64), every branch from 5.4 to 8.5, and for
-Windows x64** (7.2 to 8.5, nts and ts), with checksums; one C source file for everything else. On a PHP that already carries the fix, vendor
-backports included, it notices and steps aside.
+Windows x64** (7.2 to 8.5, nts and ts), with checksums; one C source file for everything else. On a PHP that already carries the php2shell fix,
+vendor backports included, its php2shell layers notice that and step aside; the two protections above stay on.
 
 **Install the official PHP release** (8.5.12, 8.4.27, 8.3.36, 8.2.35, and the PHP team's backports
 for 7.4, 8.0 and 8.1, which Sury extended down to 5.6); we recommend it without reservation. **This
@@ -146,8 +155,24 @@ module on unpatched engines.
   hp_uploadprogress_guard` shows `unserialize() re-entrancy isolation ... => active (unserialize,
   session_decode)`. Unlike the php2shell layers it does not step aside on patched PHP, because no PHP release
   contains a fix.
-* **Binaries.** Linux x86_64 and aarch64 for 5.4 to 8.5 are rebuilt as 3.2.0 (the 5.4 aarch64 file and the
-  Windows DLLs follow as soon as their builds finish; until then those files are 3.1.0).
+
+**v3.2.1** (22 October): SimpleXML garbage-collector double free on 8.4.27 and 8.5.12.
+
+* **The bug.** The fix for GH-24050 in 8.4.27 and 8.5.12 lets the garbage collector put the table an
+  object's `get_gc` handler returns into its buffer. SimpleXML returns its own properties table there and
+  frees it in `sxe_object_free_storage()` with `zend_hash_release()`, which leaves the buffer slot behind;
+  the collector then frees the table a second time. Reached whenever a SimpleXML object whose properties
+  were materialized (`json_encode()`, an `(array)` cast, `get_object_vars()`) is collected as part of a
+  reference cycle. Reported as [php-src#24488](https://github.com/php/php-src/issues/24488) (Status:
+  Verified); 8.4.26, 8.3.36 and 8.2.35 do not have it.
+* **The fix.** The approved upstream fix releases the table with `zend_array_release()`, which removes it
+  from the collector's buffer first. The module wraps SimpleXML's `free_obj` handler to do exactly that: it
+  takes the table off the object, lets SimpleXML free the rest, and releases the table with
+  `zend_array_release()`. Installed on the first request, only on 8.4 from 8.4.27 and 8.5 from 8.5.12; once
+  PHP ships the fix the wrapper still releases the table exactly once, so it is harmless.
+* **Switch.** `hp_uploadprogress_guard.simplexml_gc_fix = 1` (default; `PHP_INI_SYSTEM`). `php --ri
+  hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
+  affected releases and `not needed (this PHP release)` elsewhere.
 
 **22 October: arm64 and Windows.** Prebuilt `.so` files for aarch64 (all branches 5.6 to 8.5, same old-glibc
 images as x86_64) and Windows x64 DLLs for 7.2 to 8.5, nts and ts, built by the `Windows build` workflow with
@@ -196,6 +221,8 @@ Three things happen at process start. None of them is visible to an application:
    not). A nested `unserialize()` or `session_decode()` from a destructor, a generator or anything else
    outside PHP's `Serializable` nesting runs with its own state, so it cannot work on the bookkeeping
    `var_destroy()` has already freed. See the v3.2.0 note above.
+6. **SimpleXML does not crash the garbage collector on 8.4.27 and 8.5.12** (since v3.2.1). See the v3.2.1
+   note above.
 
 Since v3.0.2 the module also writes the master value of `session.upload_progress.enabled` to `0` and locks
 the entry at `PHP_INI_SYSTEM`: `ini_get()` returns `"0"`, `phpinfo()` shows `Off => Off`, and `.user.ini`,
@@ -680,6 +707,25 @@ returns the isolated (correct) result on every version, and the php-fpm masters 
 
 Build: 28 Linux binaries (x86_64 and aarch64, 5.4 to 8.5) with zero compiler warnings, x86_64 needing at
 most `GLIBC_2.3`, aarch64 at most `GLIBC_2.17`.
+
+**9. v3.2.1** (22 October 2026; PHP 8.2.35, 8.3.36, 8.4.26, 8.4.27 and 8.5.12 built from the php.net release
+archives with SimpleXML; Valgrind with `USE_ZEND_ALLOC=0`).
+
+| PHP | reproducer without module (three trigger styles) | with v3.2.1 |
+|---|---|---|
+| 8.4.26 | clean | clean (workaround off: not needed) |
+| 8.4.27 | `Invalid read` | clean |
+| 8.5.12 | `Invalid read` | clean |
+| 8.3.36, 8.2.35 | clean | clean (not needed) |
+
+A SimpleXML behaviour script (the `json_decode(json_encode())` idiom, `get_object_vars()`, casts, attributes and
+namespaces, iteration, XPath, `count()`, clones, `addChild()`, `asXML()`, a `SimpleXMLElement` subclass,
+`SimpleXMLIterator`, `dom_import_simplexml()`, 2 000 objects in collected cycles) aborts with `zend_mm_heap
+corrupted` on stock 8.4.27 and 8.5.12; with v3.2.1 it completes, its output is byte-identical to stock 8.4.26,
+and it is clean under Valgrind. PHP's own `ext/simplexml` tests (164 and 165 `.phpt`): per-test results
+identical with and without the module, 0 failures. php-fpm with tracing JIT on 8.5.12: the script three times
+in one worker, identical results, no crash. The v3.2.0 checks (unserialize reproducers, behaviour suite) are
+unchanged. On a DirectAdmin staging host with 8.4.27 the script crashed with v3.2.0 and completed with v3.2.1.
 
 ## Repository layout
 
