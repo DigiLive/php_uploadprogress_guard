@@ -544,6 +544,24 @@ the repository root (`config.w32` picks the parser copy; PHP 5.x has no phpize o
 
 ### Debian / Ubuntu with Sury packages
 
+`install_guard.sh` does the steps below for every PHP version under `/etc/php` (or the ones you name with
+`--php X.Y`), x86_64 or arm64. It downloads the module for each version, checks it against `SHA256SUMS`,
+loads it in a separate PHP process first, swaps the `.so` in atomically, and installs the ini only if none
+is there yet, so a `mode` or `allow_ips` you set survives updates. Without `--reload` it touches no running
+service: the module is active for the CLI at once and for PHP-FPM / Apache after their next reload. With
+`--reload` it runs `php-fpmX.Y -t` / `apache2ctl -t`, reloads gracefully, and then checks that the running
+master really has the module loaded. Re-run it to update; `--remove` undoes everything. The checksum
+catches a broken download, not a compromised source: read the script, and pin `--ref` to a commit you
+reviewed.
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/HOSTED-POWER/php_uploadprogress_guard/main/install_guard.sh
+less install_guard.sh
+sudo bash install_guard.sh --reload                       # or: --php 8.3, --ref <commit>, --remove
+```
+
+By hand, per version:
+
 ```sh
 V=8.3
 install -m 0644 dist/hp_uploadprogress_guard-$V.so "$(php$V -n -r 'echo PHP_EXTENSION_DIR;')/hp_uploadprogress_guard.so"
