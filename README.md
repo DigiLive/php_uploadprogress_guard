@@ -508,6 +508,7 @@ php -i | findstr /C:"PHP Version" /C:"Thread Safety" /C:"Compiler" /C:"extension
 # e.g. 8.3.x, Thread Safety => disabled (nts) or enabled (ts), Compiler => Visual C++ 2019 (vs16)
 copy dist\windows\php_hp_uploadprogress_guard-8.3-nts-vs16-x64.dll "C:\php\ext\php_hp_uploadprogress_guard.dll"
 # then in php.ini:  extension=hp_uploadprogress_guard   and restart IIS / Apache
+# PHP 5.6 takes the file name only:  extension=php_hp_uploadprogress_guard.dll  (the bare name needs 7.2+)
 php --ri hp_uploadprogress_guard
 ```
 
