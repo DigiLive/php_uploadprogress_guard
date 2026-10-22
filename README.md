@@ -1,6 +1,6 @@
 # hp_uploadprogress_guard
 
-**v3.2.2, 22 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
+**v3.2.3, 22 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
 more problems have surfaced in current PHP. This module now covers both, on patched and unpatched PHP alike,
 so **keep it installed after you upgrade.**
 
@@ -173,6 +173,19 @@ module on unpatched engines.
 * **Switch.** `hp_uploadprogress_guard.simplexml_gc_fix = 1` (default; `PHP_INI_SYSTEM`). `php --ri
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
+
+**v3.2.3** (22 October, evening): thread-safe SAPIs ran PHP's parser, not ours. PHP keeps the table of
+POST handlers in per-thread SAPI globals, and every new thread starts from PHP's default entries. The
+module registered its multipart handler once, at startup, so on a thread-safe build with a threaded SAPI
+(Apache `mod_php` with mpm_winnt, worker or event; the Windows `ts` DLLs are exactly that case) the request
+threads kept PHP's own parser, `mode=block` could not refuse anything, and `--ri` still said "handler
+replaced => yes" because that was a flag set at startup. Reported privately after #14 (thank you). Now the
+handler is installed in every thread before its first request, and the status rows read the live table.
+The other layers (upload-progress detach, out-of-memory exit, request-state reset, `unserialize()`
+isolation) are process-wide hooks and were active on those threads all along. Not affected: NTS builds
+(php-fpm, php-cgi, CLI, all prebuilt `.so` files and the `nts` DLLs) and prefork `mod_php`. Verified with
+Apache mpm_event + a thread-safe PHP 8.4: before, concurrent uploads passed on every worker thread; after,
+every one is refused in `mode=block`, and phpinfo on each thread reports the live state.
 
 **v3.2.2** (22 October): PHP 5 thread-safe builds. The PHP 5 code paths used engine globals from functions
 without a thread context, so a ZTS build of 5.4 to 5.6 (Linux `--enable-maintainer-zts`, Windows TS) did not
@@ -454,6 +467,15 @@ top of the difference in mechanism.
   flavour (checked at load time). The prebuilt files are NTS x86_64 and load on any NTS build of that
   minor: Sury, Remi, cPanel EA4, DirectAdmin CustomBuild, the official Docker images. ZTS builds need
   a rebuild from source.
+* **Thread-safe SAPIs** (Apache `mod_php` with mpm_winnt, worker or event; the Windows `ts` DLLs): the
+  multipart handler is installed per thread since v3.2.3; earlier versions only covered the startup thread
+  there, which phpinfo did not show. On a threaded SAPI, check phpinfo through the web server, not `php --ri`.
+* **Other extensions that replace the POST handlers** (Suhosin, and anything that registers post entries
+  from a Zend-extension startup hook): they install after every module's MINIT and therefore win, in any
+  load order; the module does not fight that. Suhosin's own multipart parser then handles the body with
+  Suhosin's limits, `--ri`/phpinfo reports "handler replaced => no (another extension installed its own
+  handler in this thread)", and the other layers stay active. Measured with the NewEraCracker Suhosin fork
+  on PHP 5.6 (#14).
 * **CPU architecture:** prebuilt files for x86_64 and aarch64 (arm64), both built on the same old-glibc
   images (`build.sh`, `ARCHS="x86_64 aarch64"`, aarch64 under QEMU). Highest glibc symbol version required:
   `GLIBC_2.3` on x86_64 (`memcpy` is bound to its original symbol version in `src/hp_glibc_compat.h`, so

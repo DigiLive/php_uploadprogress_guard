@@ -103,7 +103,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.2"
+#define HP_MPG_VERSION "3.2.3"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -129,7 +129,66 @@ SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler);
 static SAPI_POST_HANDLER_FUNC(hp_upg_dispatch);
 
 static sapi_post_entry hp_upg_entry = { MULTIPART_CONTENT_TYPE, sizeof(MULTIPART_CONTENT_TYPE) - 1, NULL, hp_upg_dispatch };
-static int hp_upg_installed = 0;
+static int hp_upg_want_install = 0; /* decided once at MINIT: mode and whether PHP already carries the fix */
+
+/* The SAPI's table of POST handlers lives in per-thread SAPI globals: on a thread-safe build every new thread
+ * starts from PHP's default entries (sapi_globals_ctor), so a handler registered at MINIT exists in the
+ * startup thread only; Apache's request threads (mpm_winnt, worker, event) would keep PHP's own parser. The
+ * entry is therefore installed per thread, from the module-globals constructor, which the engine runs in
+ * every new thread before its first request. The status rows read the live table, never a flag. */
+ZEND_BEGIN_MODULE_GLOBALS(hp_uploadprogress_guard)
+	int entry_installed;
+ZEND_END_MODULE_GLOBALS(hp_uploadprogress_guard)
+ZEND_DECLARE_MODULE_GLOBALS(hp_uploadprogress_guard)
+#ifdef ZTS
+# if PHP_VERSION_ID >= 70000
+#  define HP_UPG_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(hp_uploadprogress_guard, v)
+# else
+#  define HP_UPG_G(v) TSRMG(hp_uploadprogress_guard_globals_id, zend_hp_uploadprogress_guard_globals *, v)
+# endif
+#else
+# define HP_UPG_G(v) (hp_uploadprogress_guard_globals.v)
+#endif
+
+static int hp_upg_install_entry(HP_UPG_TSRMLS_D)
+{
+#if PHP_VERSION_ID < 70000
+	sapi_unregister_post_entry(&hp_upg_entry TSRMLS_CC);
+	return sapi_register_post_entry(&hp_upg_entry TSRMLS_CC) == SUCCESS;
+#else
+	sapi_unregister_post_entry(&hp_upg_entry);
+	return sapi_register_post_entry(&hp_upg_entry) == SUCCESS;
+#endif
+}
+
+/* Is our handler the one the current thread's SAPI table holds for multipart/form-data right now? */
+static int hp_upg_entry_live(HP_UPG_TSRMLS_D)
+{
+	sapi_post_entry *e;
+#if PHP_VERSION_ID < 70000
+	if (zend_hash_find(&SG(known_post_content_types), MULTIPART_CONTENT_TYPE, sizeof(MULTIPART_CONTENT_TYPE), (void **) &e) != SUCCESS) {
+		return 0;
+	}
+#else
+	e = (sapi_post_entry *) zend_hash_str_find_ptr(&SG(known_post_content_types), MULTIPART_CONTENT_TYPE, sizeof(MULTIPART_CONTENT_TYPE) - 1);
+	if (!e) {
+		return 0;
+	}
+#endif
+	return e->post_handler == hp_upg_dispatch;
+}
+
+static PHP_GINIT_FUNCTION(hp_uploadprogress_guard)
+{
+#if defined(COMPILE_DL_HP_UPLOADPROGRESS_GUARD) && defined(ZTS) && PHP_VERSION_ID >= 70000
+	ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+	hp_uploadprogress_guard_globals->entry_installed = 0;
+	/* 0 in the startup thread (runs before MINIT, which installs there itself); 1 for every later thread */
+	if (hp_upg_want_install) {
+		hp_uploadprogress_guard_globals->entry_installed = hp_upg_install_entry(HP_UPG_TSRMLS_C);
+	}
+}
 static int hp_upg_detached = 0;
 static int hp_upg_ini_forced = 0;
 static int hp_upg_memlimit_forced = 0;
@@ -895,15 +954,8 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 		const char *mode = INI_STR("hp_uploadprogress_guard.mode");
 		/* native: never replace. parse on a PHP that already carries the fix: step aside too. */
 		if (!((mode && strcasecmp(mode, "native") == 0) || (hp_upg_php_patched && !(mode && strcasecmp(mode, "block") == 0)))) {
-#if PHP_VERSION_ID < 70000
-			sapi_unregister_post_entry(&hp_upg_entry TSRMLS_CC);
-			if (sapi_register_post_entry(&hp_upg_entry TSRMLS_CC) == SUCCESS) {
-#else
-			sapi_unregister_post_entry(&hp_upg_entry);
-			if (sapi_register_post_entry(&hp_upg_entry) == SUCCESS) {
-#endif
-				hp_upg_installed = 1;
-			}
+			hp_upg_want_install = 1;
+			HP_UPG_G(entry_installed) = hp_upg_install_entry(HP_UPG_TSRMLS_C);
 		}
 	}
 	if (INI_BOOL("hp_uploadprogress_guard.detach_upload_progress") && php_rfc1867_callback != NULL) {
@@ -956,17 +1008,20 @@ static PHP_MSHUTDOWN_FUNCTION(hp_uploadprogress_guard)
 
 static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 {
+	int live;
 	php_info_print_table_start();
 	php_info_print_table_row(2, HP_MPG_NAME, "enabled");
 	php_info_print_table_row(2, "version", HP_MPG_VERSION);
-	php_info_print_table_row(2, "multipart/form-data handler replaced", hp_upg_installed ? "yes" : "no");
+	live = hp_upg_entry_live(HP_UPG_TSRMLS_C);
+	php_info_print_table_row(2, "multipart/form-data handler replaced", live ? "yes"
+		: (hp_upg_want_install ? "no (another extension installed its own handler in this thread, see README)" : "no"));
 	php_info_print_table_row(2, "mode", INI_STR("hp_uploadprogress_guard.mode"));
-	php_info_print_table_row(2, "parser memory-headroom guard", hp_upg_installed ? (PG(memory_limit) > 0 ? "yes" : "not needed (memory_limit unlimited)") : "no (parser not replaced)");
-	php_info_print_table_row(2, "mbstring.encoding_translation requests", hp_upg_installed ? (hp_upg_mbstring ? "handed to PHP's parser" : "n/a (mbstring not loaded)") : "n/a");
+	php_info_print_table_row(2, "parser memory-headroom guard", live ? (PG(memory_limit) > 0 ? "yes" : "not needed (memory_limit unlimited)") : "no (parser not replaced)");
+	php_info_print_table_row(2, "mbstring.encoding_translation requests", live ? (hp_upg_mbstring ? "handed to PHP's parser" : "n/a (mbstring not loaded)") : "n/a");
 	php_info_print_table_row(2, "running PHP already carries the official fix", hp_upg_php_patched
 		? (hp_upg_fix_probed
-			? (hp_upg_installed ? "yes (fix symbol exported by the engine)" : "yes (fix symbol exported by the engine; parser replacement skipped)")
-			: (hp_upg_installed ? "yes" : "yes (parser replacement skipped)"))
+			? (live ? "yes (fix symbol exported by the engine)" : "yes (fix symbol exported by the engine; parser replacement skipped)")
+			: (live ? "yes" : "yes (parser replacement skipped)"))
 		: "no");
 	php_info_print_table_row(2, "session.upload_progress handler detached", hp_upg_detached ? "yes" : "no");
 	php_info_print_table_row(2, "session.upload_progress.enabled forced to 0 and locked (PHP_INI_SYSTEM)", hp_upg_ini_forced ? "yes" : "no");
@@ -1016,7 +1071,9 @@ zend_module_entry hp_uploadprogress_guard_module_entry = {
 	NULL,
 	PHP_MINFO(hp_uploadprogress_guard),
 	HP_MPG_VERSION,
-	NO_MODULE_GLOBALS,
+	PHP_MODULE_GLOBALS(hp_uploadprogress_guard),
+	PHP_GINIT(hp_uploadprogress_guard),
+	NULL,
 	ZEND_MODULE_POST_ZEND_DEACTIVATE_N(hp_uploadprogress_guard),
 	STANDARD_MODULE_PROPERTIES_EX
 };
