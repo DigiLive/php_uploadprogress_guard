@@ -91,7 +91,7 @@ static int hp_upg_engine_exports(const char *name)
 {
 	HMODULE m = NULL;
 	if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-			(LPCSTR) (void *) zend_hash_str_find_ptr, &m) || !m) {
+			(LPCSTR) (void *) zend_hash_find, &m) || !m) {
 		return 0;
 	}
 	return GetProcAddress(m, name) != NULL;
@@ -103,12 +103,26 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.1"
+#define HP_MPG_VERSION "3.2.2"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
 #if defined(ZTS) && PHP_VERSION_ID >= 70000
 ZEND_TSRMLS_CACHE_DEFINE()
+#endif
+/* thread-safe (ZTS) builds, PHP 5: a function without a TSRMLS_D parameter fetches the thread context itself
+ * (a declaration: last line of the function's declaration block). No-op on NTS and on PHP 7+. */
+#if defined(ZTS) && PHP_VERSION_ID < 70000
+#define HP_UPG_TSRMLS_FETCH() TSRMLS_FETCH()
+#else
+#define HP_UPG_TSRMLS_FETCH()
+#endif
+#if PHP_VERSION_ID < 70000
+#define HP_UPG_TSRMLS_D TSRMLS_D
+#define HP_UPG_TSRMLS_C TSRMLS_C
+#else
+#define HP_UPG_TSRMLS_D void
+#define HP_UPG_TSRMLS_C
 #endif
 
 SAPI_POST_HANDLER_FUNC(hp_rfc1867_post_handler);
@@ -137,7 +151,9 @@ static int hp_upg_is_oom_message(const char *m)
  * nothing here allocates; a file whose body was still being written is not registered yet and is left. */
 static void hp_upg_unlink_uploads(void)
 {
-	HashTable *ht = SG(rfc1867_uploaded_files);
+	HashTable *ht;
+	HP_UPG_TSRMLS_FETCH();
+	ht = SG(rfc1867_uploaded_files);
 	if (!ht) {
 		return;
 	}
@@ -203,6 +219,7 @@ static void (*hp_upg_orig_error_cb)(int type, const char *error_filename, const 
 
 static void hp_upg_error_cb(int type, const char *error_filename, const unsigned int error_lineno, const char *format, va_list args)
 {
+	HP_UPG_TSRMLS_FETCH();
 	if (type == E_ERROR && EG(current_execute_data) == NULL && hp_upg_is_oom_message(format)) {
 		hp_upg_oom_exit();
 	}
@@ -230,7 +247,7 @@ static void hp_upg_remove_oom_hook(void)
 
 /* ---- stale request state (see the header comment) ---- */
 static int hp_upg_state_reset = 0;
-static int (*hp_upg_orig_sapi_deactivate)(void) = NULL;
+static int (*hp_upg_orig_sapi_deactivate)(HP_UPG_TSRMLS_D) = NULL;
 static int hp_upg_sapi_wrapped = 0;
 
 #if PHP_VERSION_ID < 70000
@@ -241,11 +258,11 @@ static int hp_upg_sapi_wrapped = 0;
 
 /* sapi_deactivate_module() frees the request_info strings and then calls the SAPI's deactivate callback
  * (same order on 5.6 - 8.5): clear the freed pointers here, as the fix does right after each efree(). */
-static int hp_upg_sapi_deactivate(void)
+static int hp_upg_sapi_deactivate(HP_UPG_TSRMLS_D)
 {
 	int r = SUCCESS;
 	if (hp_upg_orig_sapi_deactivate) {
-		r = hp_upg_orig_sapi_deactivate();
+		r = hp_upg_orig_sapi_deactivate(HP_UPG_TSRMLS_C);
 	}
 	SG(request_info).auth_user = NULL;
 	SG(request_info).auth_password = NULL;
@@ -321,6 +338,7 @@ static PHP_RINIT_FUNCTION(hp_uploadprogress_guard)
 static ZEND_MODULE_POST_ZEND_DEACTIVATE_D(hp_uploadprogress_guard)
 {
 	int i;
+	HP_UPG_TSRMLS_FETCH();
 	if (hp_upg_php_patched) {
 		return SUCCESS;
 	}
@@ -358,6 +376,7 @@ static void hp_upg_force_memory_unlimited(void)
 {
 	const char name[] = "memory_limit";
 	zend_ini_entry *e;
+	HP_UPG_TSRMLS_FETCH();
 #if PHP_VERSION_ID < 70000
 	if (zend_hash_find(EG(ini_directives), (char *) name, sizeof(name), (void **) &e) != SUCCESS) {
 		return;
@@ -399,6 +418,7 @@ static void hp_upg_force_ini_off(void)
 {
 	const char name[] = "session.upload_progress.enabled";
 	zend_ini_entry *e;
+	HP_UPG_TSRMLS_FETCH();
 #if PHP_VERSION_ID < 70000
 	if (zend_hash_find(EG(ini_directives), (char *) name, sizeof(name), (void **) &e) != SUCCESS) {
 		return;
@@ -449,6 +469,10 @@ static void hp_upg_detect_patched(void)
 	zval *v;
 	size_t i;
 	int major = 0, minor = 0;
+#if PHP_VERSION_ID < 70000
+	zval **vv;
+#endif
+	HP_UPG_TSRMLS_FETCH();
 	/* Engines carrying the fix export a symbol the old ones lack, whatever version number a vendor backport
 	 * keeps: zend_handle_delayed_oom (8.2+ delayed out-of-memory) or zend_mm_safe_error_ex (7.4/8.0/8.1
 	 * "minimal mitigation": the allocator _exit()s instead of bailing out). */
@@ -457,7 +481,6 @@ static void hp_upg_detect_patched(void)
 		hp_upg_fix_probed = 1;
 	}
 #if PHP_VERSION_ID < 70000
-	zval **vv;
 	if (zend_hash_find(EG(zend_constants), "PHP_VERSION", sizeof("PHP_VERSION"), (void **) &vv) == SUCCESS) {
 		zend_constant *c = (zend_constant *) *vv;
 		v = &c->value;
@@ -518,12 +541,8 @@ typedef void (*hp_upg_handler_t)(INTERNAL_FUNCTION_PARAMETERS);
 #endif
 #if PHP_VERSION_ID < 70000
 #define HP_UPG_UNSER_DATA var_hash
-#define HP_UPG_TSRMLS_D TSRMLS_D
-#define HP_UPG_TSRMLS_C TSRMLS_C
 #else
 #define HP_UPG_UNSER_DATA data
-#define HP_UPG_TSRMLS_D void
-#define HP_UPG_TSRMLS_C
 #endif
 
 static zend_function *hp_upg_unser_fn = NULL;
@@ -796,6 +815,7 @@ static int hp_upg_client_allowed(void)
 	const char *allow = INI_STR("hp_uploadprogress_guard.allow_ips");
 	char *ip;
 	int allowed = 0;
+	HP_UPG_TSRMLS_FETCH();
 
 	if (!allow || !*allow) {
 		return 0;

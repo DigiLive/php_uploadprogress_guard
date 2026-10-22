@@ -1,6 +1,6 @@
 # hp_uploadprogress_guard
 
-**v3.2.1, 22 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
+**v3.2.2, 22 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
 more problems have surfaced in current PHP. This module now covers both, on patched and unpatched PHP alike,
 so **keep it installed after you upgrade.**
 
@@ -173,6 +173,12 @@ module on unpatched engines.
 * **Switch.** `hp_uploadprogress_guard.simplexml_gc_fix = 1` (default; `PHP_INI_SYSTEM`). `php --ri
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
+
+**v3.2.2** (22 October): PHP 5 thread-safe builds. The PHP 5 code paths used engine globals from functions
+without a thread context, so a ZTS build of 5.4 to 5.6 (Linux `--enable-maintainer-zts`, Windows TS) did not
+compile (#12, #13); the Windows symbol probe also named a PHP 7 function. Fixed: compiles, loads and passes
+the behaviour suite on 5.4 and 5.6 ZTS (Linux), the multipart flood is handled on ZTS as on NTS. No change
+in behaviour on NTS builds; the prebuilt files are rebuilt from the same source so they carry the version.
 
 **22 October: arm64 and Windows.** Prebuilt `.so` files for aarch64 (all branches 5.6 to 8.5, same old-glibc
 images as x86_64) and Windows x64 DLLs for 7.2 to 8.5, nts and ts, built by the `Windows build` workflow with
@@ -498,7 +504,8 @@ The compiler tag must match your PHP build (`php -i` prints it): vc15 for 7.2 to
 for 8.4 and 8.5, which are also the builds windows.php.net ships. Thread safety must match too (IIS FastCGI uses
 nts, Apache mod_php uses ts). x86 (32-bit), PHP 7.0/7.1 and 5.6 on Windows are not provided; those build from
 source with the PHP SDK: `phpize && configure --enable-hp-uploadprogress-guard && nmake` from the repository root
-(`config.w32` picks the parser copy). PHP 5.6 ZTS is not supported.
+(`config.w32` picks the parser copy). PHP 5.x thread-safe builds compile since v3.2.2 (verified on Linux ZTS
+5.4 and 5.6; a Windows 5.6 TS build should compile the same way, reports welcome in #12).
 
 ### Debian / Ubuntu with Sury packages
 
