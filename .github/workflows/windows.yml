@@ -8,31 +8,32 @@ on:
 
 jobs:
   build:
-    name: PHP ${{ matrix.php-version }} ${{ matrix.ts }} x64
+    name: PHP ${{ matrix.php-version }} ${{ matrix.ts }} ${{ matrix.arch }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         php-version: ['8.5', '8.4', '8.3', '8.2', '8.1', '8.0', '7.4', '7.3', '7.2']
         ts: [nts, ts]
+        arch: [x64, x86]
     steps:
       - uses: actions/checkout@v4
       - name: Build the extension
         uses: php/php-windows-builder/extension@v1
         with:
           php-version: ${{ matrix.php-version }}
-          arch: x64
+          arch: ${{ matrix.arch }}
           ts: ${{ matrix.ts }}
           args: --enable-hp-uploadprogress-guard
           run-tests: 'false'
       - name: Install a matching PHP to load the DLL
-        if: matrix.ts == 'nts'
+        if: matrix.ts == 'nts' && matrix.arch == 'x64'
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php-version }}
           ini-values: display_errors=stderr
       - name: Load the DLL and show --ri
-        if: matrix.ts == 'nts'
+        if: matrix.ts == 'nts' && matrix.arch == 'x64'
         shell: pwsh
         run: |
           Get-ChildItem -Path artifacts -Recurse | ForEach-Object { $_.FullName }
@@ -43,3 +44,28 @@ jobs:
           $out = & php -n -d "extension=$($dll.FullName)" --ri hp_uploadprogress_guard 2>&1 | Out-String
           Write-Host $out
           if ($out -notmatch 'version => 3\.' -or $out -match 'Unable to load') { Write-Error "DLL did not load"; exit 1 }
+      - name: Load the x86 DLL in the official windows.php.net build
+        if: matrix.arch == 'x86'
+        shell: pwsh
+        run: |
+          # latest release of each branch and its compiler tag, as named on windows.php.net
+          $rel = @{ '7.2'='7.2.34 VC15'; '7.3'='7.3.33 VC15'; '7.4'='7.4.33 vc15'; '8.0'='8.0.30 vs16'; '8.1'='8.1.33 vs16';
+                    '8.2'='8.2.35 vs16'; '8.3'='8.3.36 vs16'; '8.4'='8.4.27 vs17'; '8.5'='8.5.12 vs17' }
+          $v, $cc = $rel['${{ matrix.php-version }}'].Split(' ')
+          $nts = if ('${{ matrix.ts }}' -eq 'nts') { '-nts' } else { '' }
+          $zip = "php-$v$nts-Win32-$cc-x86.zip"
+          $ok = $false
+          foreach ($base in 'releases', 'releases/archives') {
+            curl.exe -sfL -o php.zip "https://windows.php.net/downloads/$base/$zip"
+            if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "PHP: $base/$zip"; break }
+          }
+          if (-not $ok) { Write-Error "$zip not found on windows.php.net"; exit 1 }
+          Expand-Archive php.zip -DestinationPath phpx86 -Force
+          Get-ChildItem -Path artifacts -Filter *.zip -Recurse | ForEach-Object { Expand-Archive -Path $_.FullName -DestinationPath built -Force }
+          $dll = Get-ChildItem -Path artifacts, built -Filter "php_hp_uploadprogress_guard*.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { Write-Error "php_hp_uploadprogress_guard.dll not found"; exit 1 }
+          Write-Host "DLL: $($dll.FullName)"
+          & phpx86\php.exe -n -r "echo PHP_VERSION, ' ', PHP_ZTS ? 'ts' : 'nts', ' ', PHP_INT_SIZE * 8, 'bit', PHP_EOL;"
+          $out = & phpx86\php.exe -n -d "extension=$($dll.FullName)" --ri hp_uploadprogress_guard 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'version => 3\.' -or $out -match 'Unable to load|Warning') { Write-Error "DLL did not load"; exit 1 }
