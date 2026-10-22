@@ -91,6 +91,16 @@ Build fixes, same evening (source only, binaries unchanged): the 7.4 and 8.0 par
 patch releases older than 7.4.14 / 8.0.1 again (#6), and `config.m4` picks the 5.6 parser copy for
 PHP 5.4 and 5.5 (#5).
 
+**22 October: on the follow-up reports in the press.** Two further PHP bug reports circulated on 21 and
+22 October (a use-after-free reachable only when an application calls `unserialize()` on untrusted data,
+and a double free demonstrated with the Zend memory manager switched off). The PHP team reviewed the
+responsibly disclosed one and stated it is "an unrelated issue with no connection to the two vulnerabilities
+mitigated today" and "not urgent in any way"; the other concerns a code path the PHP project has long
+documented as unsafe to expose to untrusted input regardless of engine bugs. Neither touches the multipart
+parser, session state, OPcache or the memory-limit bailout. The two critical vulnerabilities,
+CVE-2026-109618 and CVE-2026-109619, are fixed in the released PHP versions and remain fully covered by this
+module on unpatched engines; nothing in those reports changes that.
+
 **22 October: arm64 and Windows.** Prebuilt `.so` files for aarch64 (all branches 5.6 to 8.5, same old-glibc
 images as x86_64) and Windows x64 DLLs for 7.2 to 8.5, nts and ts, built by the `Windows build` workflow with
 the PHP team's php-windows-builder and loaded into a stock Windows PHP in the same run. The source needed
