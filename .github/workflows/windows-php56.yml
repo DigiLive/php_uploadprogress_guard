@@ -37,21 +37,11 @@ jobs:
           $log = "$env:RUNNER_TEMP\vs2012.log"
           $p = Start-Process -FilePath $setup.FullName -ArgumentList '/quiet','/norestart','/log',$log -Wait -PassThru
           Write-Host "setup exit code $($p.ExitCode)"
-          Write-Host "--- setup log ($log), package lines:"; if (Test-Path $log) { Select-String -Path $log -Pattern "Detected package|Planned package|Applied execute package|Applying execute package|Skipping|Error 0x|result: 0x8|Setting string variable 'PendingReboot|Condition" | ForEach-Object { $_.Line -replace '^\[[^\]]*\]\[[^\]]*\]: ', '' } | Select-Object -First 120 } else { Write-Host "(none)" }
-          Write-Host "--- per-package logs:"; Get-ChildItem "$env:RUNNER_TEMP" -Filter "vs2012_*.log" | ForEach-Object { "$($_.Name) $($_.Length)" }
-          Get-ChildItem "$env:RUNNER_TEMP" -Filter "vs2012_*compilercore86.log" | ForEach-Object { Write-Host "--- $($_.Name):"; Select-String -Path $_.FullName -Pattern "error status|Return value 3|ADDLOCAL|REMOVE=|Feature: |cl\.exe|INSTALLDIR|VCINSTALLDIR|TARGETDIR" | Select-Object -First 40 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(220, $_.Line.Length)) } }
-          Write-Host "--- VC\bin files:"; Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\bin" -File -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" } | Select-Object -First 60
-          Write-Host "--- VC\bin\x86_amd64 files:"; Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\bin\x86_amd64" -File -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" } | Select-Object -First 40
-          Write-Host "--- cl.exe on C: (Program Files, ProgramData, Users):"; Get-ChildItem "C:\Program Files", "C:\ProgramData", "C:\Users" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object { $_.FullName }
-          Write-Host "--- dd_* logs in TEMP:"; Get-ChildItem $env:TEMP -Filter "dd_*" -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name) $($_.Length)" }
-          Get-ChildItem $env:TEMP -Filter "dd_wdexpress_full_*.log" -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 1 | ForEach-Object { Write-Host "--- $($_.Name):"; Select-String -Path $_.FullName -Pattern "Exit code|error|Error|block|Block|not supported|Setting ex" | Select-Object -Last 40 | ForEach-Object { $_.Line } }
-          Write-Host "--- Program Files (x86):"; Get-ChildItem "C:\Program Files (x86)" -Directory | Where-Object { $_.Name -match "Visual|Microsoft SDKs|Windows Kits" } | ForEach-Object { $_.FullName }
-          Write-Host "--- VS 11.0 tree:"; if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio 11.0") { Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 11.0" -Recurse -Depth 2 -Directory | ForEach-Object { $_.FullName } }
-          Write-Host "--- cl.exe anywhere under Program Files (x86):"; Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter cl.exe -ErrorAction SilentlyContinue | Select-Object -First 10 | ForEach-Object { $_.FullName }
-          Write-Host "--- uninstall registry:"; Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Visual Studio|Visual C\+\+ 11|2012" } | ForEach-Object { $_.DisplayName }
           $cl = "C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\bin\cl.exe"
-          if (-not (Test-Path $cl)) { throw "cl.exe not installed" }
-          & $cl 2>&1 | Select-Object -First 1
+          if (-not (Test-Path $cl)) { if (Test-Path $log) { Select-String -Path $log -Pattern "Error 0x|result: 0x8" | Select-Object -Last 20 | ForEach-Object { $_.Line } }; throw "cl.exe not installed" }
+          Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\bin" -Recurse -Filter cl.exe | ForEach-Object { $_.FullName }
+          cmd /c "`"$cl`" 2>&1 | findstr /C:`"Version`""
+          exit 0
 
       - name: PHP SDK tools (legacy) and PHP 5.6.40 source
         shell: pwsh
