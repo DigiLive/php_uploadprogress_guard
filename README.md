@@ -491,11 +491,11 @@ top of the difference in mechanism.
 
 ## Install
 
-Every version is published as a [GitHub Release](https://github.com/HOSTED-POWER/php_uploadprogress_guard/releases/latest).
-The easiest download is the bundle, `hp_uploadprogress_guard-<version>.zip` (or `.tar.gz`, same content): every
-Linux `.so` and Windows DLL, the ini files, the source, `install_guard.sh` and an `INSTALL.txt` with the steps
-per platform, all covered by one `SHA256SUMS`. The single files are attached to the release as well, and are
-in `dist/` on `main`. Watch the repository with "Custom > Releases" to be notified of new versions.
+Every version is published as a [GitHub Release](https://github.com/HOSTED-POWER/php_uploadprogress_guard/releases/latest)
+with one download: `hp_uploadprogress_guard-<version>.zip` (or `.tar.gz`, same content), holding every Linux `.so`
+and Windows DLL, the ini files, the source, `install_guard.sh` and an `INSTALL.txt` with the steps per platform,
+all covered by a `SHA256SUMS` inside. The single files are also in `dist/` on `main`. Watch the repository with
+"Custom > Releases" to be notified of new versions.
 
 ### Build from source (any PHP, any flavour)
 
