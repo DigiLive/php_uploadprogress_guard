@@ -491,6 +491,10 @@ top of the difference in mechanism.
 
 ## Install
 
+Every version is published as a [GitHub Release](https://github.com/HOSTED-POWER/php_uploadprogress_guard/releases/latest)
+with all prebuilt files (Linux `.so`, Windows DLLs, `install_guard.sh`) and one `SHA256SUMS`; the same files
+are in `dist/` on `main`. Watch the repository with "Custom > Releases" to be notified of new versions.
+
 ### Build from source (any PHP, any flavour)
 
 ```sh
