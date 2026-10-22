@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64]
-        ts: [nts]
+        arch: [x64, x86]
+        ts: [nts, ts]
     steps:
       - uses: actions/checkout@v4
         with:
