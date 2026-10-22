@@ -180,6 +180,9 @@ compile (#12, #13); the Windows symbol probe also named a PHP 7 function. Fixed:
 the behaviour suite on 5.4 and 5.6 ZTS (Linux), the multipart flood is handled on ZTS as on NTS. No change
 in behaviour on NTS builds; the prebuilt files are rebuilt from the same source so they carry the version.
 
+**22 October, later: Windows DLLs for PHP 5.6** (VC11, x64 and x86, nts and ts), built and load-tested in CI
+against the official 5.6.40 VC11 builds; see [Windows](#windows).
+
 **22 October: arm64 and Windows.** Prebuilt `.so` files for aarch64 (all branches 5.6 to 8.5, same old-glibc
 images as x86_64) and Windows x64 DLLs for 7.2 to 8.5, nts and ts, built by the `Windows build` workflow with
 the PHP team's php-windows-builder and loaded into a stock Windows PHP in the same run. The source needed
@@ -487,10 +490,14 @@ the architecture from `ansible_facts['architecture']`.
 
 ### Windows
 
-`dist/windows/` holds a DLL per PHP minor (7.2 to 8.5), thread safety and compiler, with `SHA256SUMS`:
-`php_hp_uploadprogress_guard-<X.Y>-<nts|ts>-<vc15|vs16|vs17>-x64.dll`. They are built by the `Windows build`
-workflow in this repository with the PHP team's [php-windows-builder](https://github.com/php/php-windows-builder),
-and the nts ones are loaded into a stock Windows PHP in the same run (`--ri` output in the job log).
+`dist/windows/` holds a DLL per PHP minor (5.6, 7.2 to 8.5), thread safety and compiler, with `SHA256SUMS`:
+`php_hp_uploadprogress_guard-<X.Y>-<nts|ts>-<vc11|vc15|vs16|vs17>-<x64|x86>.dll`. The 7.2 to 8.5 files are built
+by the `Windows build` workflow in this repository with the PHP team's
+[php-windows-builder](https://github.com/php/php-windows-builder), and the nts ones are loaded into a stock
+Windows PHP in the same run (`--ri` output in the job log). The 5.6 files (VC11, x64 and x86, nts and ts) come
+from the `Windows build PHP 5.6 (VC11)` workflow: Visual Studio 2012 Express is installed on the runner from
+Microsoft's ISO, PHP 5.6.40 is built in-tree with the extension as a shared module, and every DLL is loaded
+into the official 5.6.40 VC11 zip from windows.php.net before it is published.
 
 ```powershell
 php -i | findstr /C:"PHP Version" /C:"Thread Safety" /C:"Compiler" /C:"extension_dir"
@@ -502,10 +509,10 @@ php --ri hp_uploadprogress_guard
 
 The compiler tag must match your PHP build (`php -i` prints it): vc15 for 7.2 to 7.4, vs16 for 8.0 to 8.3, vs17
 for 8.4 and 8.5, which are also the builds windows.php.net ships. Thread safety must match too (IIS FastCGI uses
-nts, Apache mod_php uses ts). x86 (32-bit), PHP 7.0/7.1 and 5.6 on Windows are not provided; those build from
-source with the PHP SDK: `phpize && configure --enable-hp-uploadprogress-guard && nmake` from the repository root
-(`config.w32` picks the parser copy). PHP 5.x thread-safe builds compile since v3.2.2 (verified on Linux ZTS
-5.4 and 5.6; a Windows 5.6 TS build should compile the same way, reports welcome in #12).
+nts, Apache mod_php uses ts); 5.6 is vc11. x86 (32-bit) for 7.2+ and PHP 7.0/7.1 on Windows are not provided;
+those build from source with the PHP SDK: `phpize && configure --enable-hp-uploadprogress-guard && nmake` from
+the repository root (`config.w32` picks the parser copy; PHP 5.x has no phpize on Windows, build in-tree as the
+5.6 workflow does). PHP 5.x thread-safe builds compile since v3.2.2.
 
 ### Debian / Ubuntu with Sury packages
 
