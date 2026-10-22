@@ -476,6 +476,10 @@ cd src && phpize && ./configure && make
 # -> modules/hp_uploadprogress_guard.so ; `make install` drops it in extension_dir
 ```
 
+If `make` stops with `libtool: Version mismatch error` (PHP 5.x phpize ships older libtool macros than the
+system libtool, seen on Gentoo, #13), regenerate the build files once after `phpize`:
+`libtoolize --copy --force && aclocal && autoreconf --force --install`, then `./configure && make` again.
+
 ### Prebuilt (Linux)
 
 `dist/` holds one NTS build per PHP minor and CPU architecture, with `SHA256SUMS`:
