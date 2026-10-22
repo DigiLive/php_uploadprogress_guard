@@ -1,0 +1,96 @@
+name: Windows build PHP 5.6 (VC11)
+
+# PHP 5.6 on Windows is built with Visual C++ 11 (Visual Studio 2012); php-windows-builder starts at 7.2.
+# This job installs Visual Studio Express 2012 for Windows Desktop from Microsoft's ISO, builds PHP 5.6.40
+# in-tree with the extension as a shared module (no other extensions, no deps needed) and loads the DLL
+# into the official 5.6.40 VC11 zip from windows.php.net as the test. Manual trigger: it takes a while.
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/windows-php56.yml']
+
+jobs:
+  build:
+    name: PHP 5.6 ${{ matrix.ts }} ${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+        ts: [nts, ts]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ext
+
+      - name: Install Visual Studio Express 2012 for Windows Desktop (VC11)
+        shell: pwsh
+        run: |
+          $iso = "$env:RUNNER_TEMP\VS2012_WDX_ENU.iso"
+          curl.exe -sSL -o $iso https://download.microsoft.com/download/1/F/5/1F519CC5-0B90-4EA3-8159-33BFB97EF4D9/VS2012_WDX_ENU.iso
+          Write-Host "ISO: $((Get-Item $iso).Length) bytes"
+          $m = Mount-DiskImage -ImagePath $iso -PassThru
+          $drive = ($m | Get-Volume).DriveLetter
+          Get-ChildItem "${drive}:\" | ForEach-Object { $_.Name }
+          $setup = Get-ChildItem "${drive}:\" -Filter "*.exe" | Select-Object -First 1
+          $log = "$env:RUNNER_TEMP\vs2012.log"
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/quiet','/norestart','/log',$log -Wait -PassThru
+          Write-Host "setup exit code $($p.ExitCode)"
+          $cl = "C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\bin\cl.exe"
+          if (-not (Test-Path $cl)) { if (Test-Path $log) { Get-Content $log -Tail 60 }; throw "cl.exe not installed" }
+          & $cl 2>&1 | Select-Object -First 1
+
+      - name: PHP SDK tools (legacy) and PHP 5.6.40 source
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o sdk.zip https://github.com/php/php-sdk-binary-tools/archive/refs/heads/legacy.zip
+          Expand-Archive sdk.zip -DestinationPath sdk
+          curl.exe -sSL -o php-src.zip https://windows.php.net/downloads/releases/archives/php-5.6.40-src.zip
+          Expand-Archive php-src.zip -DestinationPath phpsrc
+          $src = Get-ChildItem phpsrc -Directory | Select-Object -First 1
+          Rename-Item $src.FullName php
+          Copy-Item -Recurse ext phpsrc\php\ext\hp_uploadprogress_guard
+          Get-ChildItem phpsrc\php\ext\hp_uploadprogress_guard | ForEach-Object { $_.Name }
+
+      - name: Build PHP 5.6.40 with the extension as a shared module
+        shell: cmd
+        run: |
+          set PATH=%CD%\sdk\php-sdk-binary-tools-legacy\bin;%PATH%
+          if "${{ matrix.arch }}"=="x64" (set VCARCH=x86_amd64) else (set VCARCH=x86)
+          call "C:\Program Files (x86)\Microsoft Visual Studio 11.0\VC\vcvarsall.bat" %VCARCH%
+          cd phpsrc\php
+          call buildconf.bat
+          if "${{ matrix.ts }}"=="nts" (set ZTSFLAG=--disable-zts) else (set ZTSFLAG=)
+          call configure.bat --disable-all --enable-cli --enable-hp-uploadprogress-guard=shared %ZTSFLAG%
+          nmake
+          dir /s /b php_hp_uploadprogress_guard.dll php.exe
+
+      - name: Collect the DLL
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem phpsrc\php -Recurse -Filter php_hp_uploadprogress_guard.dll | Select-Object -First 1
+          if (-not $dll) { throw "DLL not built" }
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item $dll.FullName "out\php_hp_uploadprogress_guard-5.6-${{ matrix.ts }}-vc11-${{ matrix.arch }}.dll"
+          Get-ChildItem out
+
+      - name: Load the DLL in the official PHP 5.6.40 VC11 build
+        shell: pwsh
+        run: |
+          $vc = "$env:RUNNER_TEMP\vcredist.exe"
+          curl.exe -sSL -o $vc https://download.microsoft.com/download/1/6/B/16B06F60-3B20-4FF2-B699-5E9B7962F9AE/VSU_4/vcredist_${{ matrix.arch }}.exe
+          Start-Process -FilePath $vc -ArgumentList '/quiet','/norestart' -Wait
+          $nts = if ('${{ matrix.ts }}' -eq 'nts') { '-nts' } else { '' }
+          curl.exe -sSL -o php.zip "https://windows.php.net/downloads/releases/archives/php-5.6.40${nts}-Win32-VC11-${{ matrix.arch }}.zip"
+          Expand-Archive php.zip -DestinationPath php56
+          $dll = (Get-ChildItem out\*.dll).FullName
+          & php56\php.exe -n -r "echo PHP_VERSION, ' ', PHP_ZTS ? 'ts' : 'nts', ' ', PHP_INT_SIZE * 8, 'bit', PHP_EOL;"
+          $out = & php56\php.exe -n -d "extension=$dll" --ri hp_uploadprogress_guard 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'version => 3\.' -or $out -match 'Unable to load|Warning') { throw "DLL did not load" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: php_hp_uploadprogress_guard-5.6-${{ matrix.ts }}-vc11-${{ matrix.arch }}
+          path: out/*.dll
