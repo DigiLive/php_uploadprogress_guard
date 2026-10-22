@@ -1,5 +1,20 @@
 # hp_uploadprogress_guard
 
+**v3.2.0, 22 October 2026: protection PHP itself does not ship yet.** Every current PHP release,
+8.5.12, 8.4.27, 8.3.36 and 8.2.35 included, still contains a use-after-free in `unserialize()`: when
+`var_destroy()` cleans up after an unserialization, it frees its bookkeeping first and then runs object
+destructors, and a destructor that calls `unserialize()` again works on that freed memory. This is the bug
+behind the "PHP 8.5.12 patch is incomplete" claims of 21 and 22 October, reported to PHP as
+[php/php-src#24481](https://github.com/php/php-src/issues/24481). PHP has not fixed it, and it has no CVE:
+PHP does not assign CVEs to memory bugs reachable through `unserialize()` of untrusted data.
+**v3.2.0 closes it.** A nested `unserialize()` or `session_decode()` that runs from a destructor, a
+generator or anywhere outside PHP's own `Serializable` nesting now gets fresh state of its own instead of the
+freed one. Verified with Valgrind on 8.5.12, 8.4.27, 8.3.36, 8.2.35 and 7.4.33: without the module every reproducer reads
+freed memory, with v3.2.0 none does, and PHP's own serialize and session test suites give the same results
+as before. The bug needs `unserialize()` of attacker-controlled data, or code already running on the host;
+where either is possible, it is a real hole, and this is the fix for it today. Unlike the php2shell layers,
+this protection stays active on patched PHP: **keep the module installed after you upgrade.**
+
 **v3.1.0, 21 October 2026.** A small PHP extension that mirrors the official fix for
 CVE-2026-109618 / CVE-2026-109619 component by component, so that on an unpatched PHP every link of
 the published attack chain is removed, without rebuilding PHP and without changing anything for the
@@ -13,8 +28,8 @@ backports included, it notices and steps aside.
 for 7.4, 8.0 and 8.1, which Sury extended down to 5.6); we recommend it without reservation. **This
 module protects an unpatched PHP for real.** It mirrors the official fix component by component,
 tested per branch and per SAPI (see the tests below), so a host that runs it is protected today,
-whether its packages arrive tomorrow or never. After the upgrade it steps aside on its own, so there
-is nothing to undo. Read the advisories:
+whether its packages arrive tomorrow or never. After the upgrade its php2shell layers step aside on their
+own, so there is nothing to undo, and the v3.2.0 `unserialize()` protection keeps running. Read the advisories:
 [GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and
 [GHSA-6wmf-4rv5-p3rp](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp).
 
@@ -92,14 +107,47 @@ patch releases older than 7.4.14 / 8.0.1 again (#6), and `config.m4` picks the 5
 PHP 5.4 and 5.5 (#5).
 
 **22 October: on the follow-up reports in the press.** Two further PHP bug reports circulated on 21 and
-22 October (a use-after-free reachable only when an application calls `unserialize()` on untrusted data,
-and a double free demonstrated with the Zend memory manager switched off). The PHP team reviewed the
-responsibly disclosed one and stated it is "an unrelated issue with no connection to the two vulnerabilities
-mitigated today" and "not urgent in any way"; the other concerns a code path the PHP project has long
-documented as unsafe to expose to untrusted input regardless of engine bugs. Neither touches the multipart
-parser, session state, OPcache or the memory-limit bailout. The two critical vulnerabilities,
+22 October. One is the `unserialize()` use-after-free described at the top: it is real, it is present in
+8.5.12, and v3.2.0 closes it. The other is a double free demonstrated with the Zend memory manager switched
+off; the PHP team reviewed that responsibly disclosed report and stated it is "an unrelated issue with no
+connection to the two vulnerabilities mitigated today" and "not urgent in any way". Neither touches the
+multipart parser, session state, OPcache or the memory-limit bailout: the two critical vulnerabilities,
 CVE-2026-109618 and CVE-2026-109619, are fixed in the released PHP versions and remain fully covered by this
-module on unpatched engines; nothing in those reports changes that.
+module on unpatched engines.
+
+**v3.2.0** (22 October): `unserialize()` re-entrancy isolation, details below.
+
+* **The bug.** While an `unserialize()` call is active, a nested `unserialize()` or `session_decode()` shares
+  its state (`BG(unserialize)`); PHP needs that for exactly one thing, a `Serializable::unserialize()` method
+  the engine calls during parsing, whose own `unserialize()` must resolve the outer back-references. At the
+  end of the outer call `var_destroy()` frees the back-reference chunks and then drops the deferred values
+  (objects replaced by duplicate keys, the return value of `__wakeup()`, the argument of `__unserialize()`)
+  without holding `serialize_lock`. A destructor that runs at that moment and calls `unserialize()` reads and
+  writes the freed chunks.
+* **The fix.** The module wraps `unserialize()` and `session_decode()`. A nested call keeps sharing state only
+  when it comes from an engine-invoked `Serializable::unserialize()` with no destructor or generator in
+  between; every other nested call runs exactly like a top-level call, with its own state, and the outer
+  state is restored afterwards (also when the inner call ends in a fatal error). That is the behaviour the
+  reporter proposes for PHP itself, applied from outside the engine, on every branch from 5.4 to 8.5.
+* **What changes for applications.** Nothing on any normal path: top-level calls, `Serializable` nesting with
+  shared back-references, `__wakeup()`/`__unserialize()` that unserialize, autoloaders, sessions, enums,
+  fibers and generators behave exactly as before (identical output on all 14 branches, see the tests). Two
+  cases change, both from broken to correct: a destructor that unserializes its own data with a
+  back-reference during an outer call's cleanup got `false` or the wrong object from stock PHP, and gets the
+  right result now; an exception it catches around such a call escaped as an uncaught fatal error on stock
+  PHP, and is caught now.
+* **Cost.** No measurable difference on normal calls; about 50 ns extra per nested call inside the
+  deprecated `Serializable::unserialize()`.
+* **Scope.** `unserialize()` and `session_decode()`. Extensions that unserialize with PHP's serializer
+  internally (APCu, Memcached or Redis with the `php` serializer) are not wrapped; reaching the bug through
+  them needs attacker-controlled cache contents and such a destructor. On PHP 5.x the reproducers take a
+  different path and do not reach the bug; the isolation is active there too.
+* **Switch.** `hp_uploadprogress_guard.unserialize_isolation = 1` (default; `PHP_INI_SYSTEM`). `php --ri
+  hp_uploadprogress_guard` shows `unserialize() re-entrancy isolation ... => active (unserialize,
+  session_decode)`. Unlike the php2shell layers it does not step aside on patched PHP, because no PHP release
+  contains a fix.
+* **Binaries.** Linux x86_64 and aarch64 for 5.4 to 8.5 are rebuilt as 3.2.0 (the 5.4 aarch64 file and the
+  Windows DLLs follow as soon as their builds finish; until then those files are 3.1.0).
 
 **22 October: arm64 and Windows.** Prebuilt `.so` files for aarch64 (all branches 5.6 to 8.5, same old-glibc
 images as x86_64) and Windows x64 DLLs for 7.2 to 8.5, nts and ts, built by the `Windows build` workflow with
@@ -144,6 +192,10 @@ Three things happen at process start. None of them is visible to an application:
    also recognises vendor backports that keep their version number. On such an engine it leaves PHP's
    own parser in place and switches its v3.1 mechanisms off. One deployment covers patched and
    unpatched hosts, and nothing has to be undone after the upgrade.
+5. **Nested `unserialize()` calls cannot reach freed memory** (since v3.2.0, on every engine, patched or
+   not). A nested `unserialize()` or `session_decode()` from a destructor, a generator or anything else
+   outside PHP's `Serializable` nesting runs with its own state, so it cannot work on the bookkeeping
+   `var_destroy()` has already freed. See the v3.2.0 note above.
 
 Since v3.0.2 the module also writes the master value of `session.upload_progress.enabled` to `0` and locks
 the entry at `PHP_INI_SYSTEM`: `ini_get()` returns `"0"`, `phpinfo()` shows `Off => Off`, and `.user.ini`,
@@ -582,6 +634,52 @@ mechanism `active`. Neither fix symbol exists on any unpatched engine (`nm -D`).
 
 All 12 binaries: zero compiler warnings, nothing above `GLIBC_2.14`, the fix probes appear as
 versionless weak references (`objdump -T`).
+
+**8. v3.2.0** (22 October 2026; official `php:<X.Y>-cli` and `-fpm` images, PHP built from the php.net
+release archives where an image was missing; outputs verbatim).
+
+Valgrind memcheck (`USE_ZEND_ALLOC=0`), six reproducers: both paths from the public report (an object
+dropped by a duplicate key, the return value of `__wakeup()`), and the same nested call made through
+`call_user_func()`, through an explicit `Serializable::unserialize()` inside the destructor, and from a
+generator's `finally` block:
+
+| PHP | without module | with v3.2.0 | behaviour suite under Valgrind |
+|---|---|---|---|
+| 8.5.12 | `Invalid read of size 8` in `php_var_unserialize`, all six | clean, all six | 20/20, 0 errors |
+| 8.4.27 | same | clean, all six | 20/20, 0 errors |
+| 8.3.36 | same | clean, all six | 20/20, 0 errors |
+| 8.2.35 | same | clean, all six | 20/20, 0 errors |
+| 7.4.33 | same, in `zif_unserialize` | clean, all six | 18/18, 0 errors |
+| 5.6.40 | not reached (different code path on 5.x) | clean | 15/15, 0 errors |
+
+Without Valgrind the bug is silent: on stock 7.0 to 8.5.12 the nested call returns data read from the freed
+chunk (`array(0 => 0)` where it should fail); with v3.2.0 it fails cleanly (`false`).
+
+Behaviour suite (a self-checking PHP script, 14 to 20 cases depending on the branch: scalars, references,
+`Serializable` nesting with shared back-references, through a helper and two levels deep, `__wakeup()` and
+`__unserialize()` that unserialize, destructors, autoloaders, sessions through `session_decode()` and the
+files handler, `SplObjectStorage`/`ArrayObject`/`DateTime`/`SplQueue`, enums, readonly classes, fibers,
+generators, a 20 000-element payload): every case passes on 5.4, 5.5, 5.6, 7.0 to 7.4 and 8.0 to 8.5, and
+the output with the module is byte-identical to the output without it. The two changed cases (see the
+v3.2.0 note) are correct with the module on every branch; without it they are wrong or fatal on stock 7.0 to 8.5.
+
+PHP's own test suites (`ext/standard/tests/serialize`, `ext/session/tests`, 306 to 433 `.phpt` per branch)
+on 5.6, 7.0, 7.4, 8.2, 8.4 and 8.5: the results with v3.2.0 are identical to v3.1.0. The only tests that
+differ from a PHP without the module are the eight `ext/session/tests/rfc1867*.phpt`, which test the
+`session.upload_progress` feature this module has switched off since v1.
+
+OPcache with tracing JIT on 8.5 and 8.4, CLI and php-fpm: suite identical with and without the module,
+reproducers clean, the php-fpm worker serves the suite again after the reproducer, no crashes. Cost
+(8.4, one CPU, median of five alternating runs of 300 000 calls): top-level `unserialize()` 349 ns
+without, 378 ns with (within run-to-run noise); nested inside `Serializable::unserialize()` 423 ns
+without, 474 ns with.
+
+Staging, through the fleet Ansible role: DirectAdmin CustomBuild 8.2.35, 8.3.36, 8.4.27 and cPanel EA4
+8.1.34, 8.2.34, 8.3.35, 8.4.26 all report 3.2.0 with the isolation active, a live destructor-time check
+returns the isolated (correct) result on every version, and the php-fpm masters map the module.
+
+Build: 28 Linux binaries (x86_64 and aarch64, 5.4 to 8.5) with zero compiler warnings, x86_64 needing at
+most `GLIBC_2.3`, aarch64 at most `GLIBC_2.17`.
 
 ## Repository layout
 

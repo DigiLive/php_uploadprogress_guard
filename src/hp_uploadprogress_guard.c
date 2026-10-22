@@ -67,6 +67,8 @@
 #include "rfc1867.h"
 #include "ext/standard/php_versioning.h"
 #include "zend_extensions.h"
+#include "zend_interfaces.h"
+#include "ext/standard/basic_functions.h"
 #include <string.h>
 #include <stdarg.h>
 #ifdef PHP_WIN32
@@ -101,7 +103,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.1.0"
+#define HP_MPG_VERSION "3.2.0"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -490,11 +492,204 @@ static int hp_upg_native_needed(void)
 	return hp_upg_mbstring && INI_INT("mbstring.encoding_translation");
 }
 
+/* ---- unserialize() re-entrancy isolation ----
+ * unserialize() and session_decode() share the context of an outer unserialization when one is active
+ * (BG(unserialize).level > 0 and serialize_lock 0). PHP relies on that for one thing only: a
+ * Serializable::unserialize() method the engine calls while parsing, whose own unserialize() must see the
+ * outer back-references. var_destroy() frees the back-reference chunks first and then drops the dtor-list
+ * entries, __wakeup()'s return value and __unserialize()'s argument without holding serialize_lock, so a
+ * destructor that runs there and calls unserialize() reuses freed memory (use-after-free). Every nested
+ * call that is not that Serializable path, or that has a destructor or generator between it and the outer
+ * call, is run here as a top-level call: own context, outer context restored afterwards (also on bailout). */
+#if PHP_VERSION_ID >= 70200
+typedef zif_handler hp_upg_handler_t;
+#else
+typedef void (*hp_upg_handler_t)(INTERNAL_FUNCTION_PARAMETERS);
+#endif
+#if PHP_VERSION_ID < 70000
+#define HP_UPG_UNSER_DATA var_hash
+#define HP_UPG_TSRMLS_D TSRMLS_D
+#define HP_UPG_TSRMLS_C TSRMLS_C
+#else
+#define HP_UPG_UNSER_DATA data
+#define HP_UPG_TSRMLS_D void
+#define HP_UPG_TSRMLS_C
+#endif
+
+static zend_function *hp_upg_unser_fn = NULL;
+static zend_function *hp_upg_sdecode_fn = NULL;
+static hp_upg_handler_t hp_upg_orig_unser = NULL;
+static hp_upg_handler_t hp_upg_orig_sdecode = NULL;
+static int hp_upg_unser_hooked = 0;
+
+static int hp_upg_name_is(const char *n, size_t len, const char *lit, size_t litlen)
+{
+	return n && len == litlen && zend_binary_strcasecmp(n, len, lit, litlen) == 0;
+}
+
+static int hp_upg_is_origin(zend_function *f)
+{
+	return f && ((hp_upg_unser_fn && f == hp_upg_unser_fn) || (hp_upg_sdecode_fn && f == hp_upg_sdecode_fn));
+}
+
+#if PHP_VERSION_ID >= 70000
+static int hp_upg_nested_may_share(zend_execute_data *self)
+{
+	zend_execute_data *ex = self ? self->prev_execute_data : NULL;
+	int saw_serializable = 0;
+	for (; ex; ex = ex->prev_execute_data) {
+		zend_function *f = ex->func;
+		if (!f) {
+			continue;
+		}
+		if (f->type == ZEND_INTERNAL_FUNCTION) {
+			if (hp_upg_is_origin(f)) {
+				break; /* the call that opened the outer context */
+			}
+			continue;
+		}
+		if (f->common.fn_flags & ZEND_ACC_GENERATOR) {
+			return 0;
+		}
+		if (f->common.scope && f->common.function_name) {
+			const char *n = ZSTR_VAL(f->common.function_name);
+			size_t len = ZSTR_LEN(f->common.function_name);
+			if (hp_upg_name_is(n, len, "__destruct", sizeof("__destruct") - 1)) {
+				return 0;
+			}
+			if (hp_upg_name_is(n, len, "unserialize", sizeof("unserialize") - 1)
+					&& instanceof_function(f->common.scope, zend_ce_serializable)) {
+				saw_serializable = 1;
+			}
+		}
+	}
+	return saw_serializable;
+}
+#define HP_UPG_MAY_SHARE() hp_upg_nested_may_share(execute_data)
+#else
+/* PHP 5: internal calls have no frame of their own; a frame's function_state.function is the function it is
+ * calling. Frames zend_call_function() inserts have no op_array. */
+static int hp_upg_nested_may_share(TSRMLS_D)
+{
+	zend_execute_data *ex = EG(current_execute_data);
+	int first = 1, saw_serializable = 0;
+	for (; ex; ex = ex->prev_execute_data, first = 0) {
+		zend_op_array *op = ex->op_array;
+		if (!first && hp_upg_is_origin(ex->function_state.function)) {
+			break;
+		}
+		if (!op) {
+			continue;
+		}
+#ifdef ZEND_ACC_GENERATOR
+		if (op->fn_flags & ZEND_ACC_GENERATOR) {
+			return 0;
+		}
+#endif
+		if (op->scope && op->function_name) {
+			size_t len = strlen(op->function_name);
+			if (hp_upg_name_is(op->function_name, len, "__destruct", sizeof("__destruct") - 1)) {
+				return 0;
+			}
+			if (hp_upg_name_is(op->function_name, len, "unserialize", sizeof("unserialize") - 1)
+					&& instanceof_function(op->scope, zend_ce_serializable TSRMLS_CC)) {
+				saw_serializable = 1;
+			}
+		}
+	}
+	return saw_serializable;
+}
+#define HP_UPG_MAY_SHARE() hp_upg_nested_may_share(TSRMLS_C)
+#endif
+
+static void hp_upg_run_isolated(hp_upg_handler_t orig, INTERNAL_FUNCTION_PARAMETERS)
+{
+	unsigned saved_level = BG(unserialize).level;
+	void *saved_data = (void *) BG(unserialize).HP_UPG_UNSER_DATA;
+
+	BG(unserialize).level = 0;
+	BG(unserialize).HP_UPG_UNSER_DATA = NULL;
+	zend_try {
+		orig(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+	} zend_catch {
+		BG(unserialize).level = saved_level;
+		BG(unserialize).HP_UPG_UNSER_DATA = saved_data;
+		zend_bailout();
+	} zend_end_try();
+	BG(unserialize).level = saved_level;
+	BG(unserialize).HP_UPG_UNSER_DATA = saved_data;
+}
+
+#define HP_UPG_NEEDS_ISOLATION() (BG(unserialize).level && !BG(serialize_lock) && !HP_UPG_MAY_SHARE())
+
+static ZEND_NAMED_FUNCTION(hp_upg_unserialize)
+{
+	if (HP_UPG_NEEDS_ISOLATION()) {
+		hp_upg_run_isolated(hp_upg_orig_unser, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	hp_upg_orig_unser(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+static ZEND_NAMED_FUNCTION(hp_upg_session_decode)
+{
+	if (HP_UPG_NEEDS_ISOLATION()) {
+		hp_upg_run_isolated(hp_upg_orig_sdecode, INTERNAL_FUNCTION_PARAM_PASSTHRU);
+		return;
+	}
+	hp_upg_orig_sdecode(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+#if PHP_VERSION_ID < 70000
+static zend_function *hp_upg_find_function(const char *name, size_t len TSRMLS_DC)
+{
+	zend_function *f;
+	if (zend_hash_find(CG(function_table), (char *) name, len + 1, (void **) &f) == SUCCESS) {
+		return f;
+	}
+	return NULL;
+}
+#define HP_UPG_FIND(name) hp_upg_find_function(name, sizeof(name) - 1 TSRMLS_CC)
+#else
+#define HP_UPG_FIND(name) ((zend_function *) zend_hash_str_find_ptr(CG(function_table), name, sizeof(name) - 1))
+#endif
+
+static void hp_upg_hook_unserialize(HP_UPG_TSRMLS_D)
+{
+	zend_function *f = HP_UPG_FIND("unserialize");
+	if (!f || f->type != ZEND_INTERNAL_FUNCTION) {
+		return;
+	}
+	hp_upg_unser_fn = f;
+	hp_upg_orig_unser = f->internal_function.handler;
+	f->internal_function.handler = hp_upg_unserialize;
+	f = HP_UPG_FIND("session_decode");
+	if (f && f->type == ZEND_INTERNAL_FUNCTION) {
+		hp_upg_sdecode_fn = f;
+		hp_upg_orig_sdecode = f->internal_function.handler;
+		f->internal_function.handler = hp_upg_session_decode;
+	}
+	hp_upg_unser_hooked = 1;
+}
+
+static void hp_upg_unhook_unserialize(void)
+{
+	if (hp_upg_unser_fn && hp_upg_unser_fn->internal_function.handler == hp_upg_unserialize) {
+		hp_upg_unser_fn->internal_function.handler = hp_upg_orig_unser;
+	}
+	if (hp_upg_sdecode_fn && hp_upg_sdecode_fn->internal_function.handler == hp_upg_session_decode) {
+		hp_upg_sdecode_fn->internal_function.handler = hp_upg_orig_sdecode;
+	}
+	hp_upg_unser_fn = hp_upg_sdecode_fn = NULL;
+	hp_upg_unser_hooked = 0;
+}
+
 PHP_INI_BEGIN()
 	PHP_INI_ENTRY("hp_uploadprogress_guard.mode", "parse", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.allow_ips", "", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.detach_upload_progress", "1", PHP_INI_SYSTEM, NULL)
 	PHP_INI_ENTRY("hp_uploadprogress_guard.force_unlimited_memory", "0", PHP_INI_SYSTEM, NULL)
+	PHP_INI_ENTRY("hp_uploadprogress_guard.unserialize_isolation", "1", PHP_INI_SYSTEM, NULL)
 PHP_INI_END()
 
 static int hp_upg_client_allowed(void)
@@ -608,11 +803,15 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 	if (INI_BOOL("hp_uploadprogress_guard.force_unlimited_memory")) {
 		hp_upg_force_memory_unlimited();
 	}
+	if (INI_BOOL("hp_uploadprogress_guard.unserialize_isolation")) {
+		hp_upg_hook_unserialize(HP_UPG_TSRMLS_C);
+	}
 	return SUCCESS;
 }
 
 static PHP_MSHUTDOWN_FUNCTION(hp_uploadprogress_guard)
 {
+	hp_upg_unhook_unserialize();
 	hp_upg_remove_oom_hook();
 	if (hp_upg_sapi_wrapped && sapi_module.deactivate == hp_upg_sapi_deactivate) {
 		sapi_module.deactivate = hp_upg_orig_sapi_deactivate;
@@ -662,6 +861,7 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 		}
 		php_info_print_table_row(2, "memory_limit forced to -1 (unlimited) and locked", row);
 	}
+	php_info_print_table_row(2, "unserialize() re-entrancy isolation (destructors during var_destroy)", hp_upg_unser_hooked ? (hp_upg_sdecode_fn ? "active (unserialize, session_decode)" : "active (unserialize)") : "off");
 	php_info_print_table_end();
 	DISPLAY_INI_ENTRIES();
 }
