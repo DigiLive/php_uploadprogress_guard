@@ -491,9 +491,11 @@ top of the difference in mechanism.
 
 ## Install
 
-Every version is published as a [GitHub Release](https://github.com/HOSTED-POWER/php_uploadprogress_guard/releases/latest)
-with all prebuilt files (Linux `.so`, Windows DLLs, `install_guard.sh`) and one `SHA256SUMS`; the same files
-are in `dist/` on `main`. Watch the repository with "Custom > Releases" to be notified of new versions.
+Every version is published as a [GitHub Release](https://github.com/HOSTED-POWER/php_uploadprogress_guard/releases/latest).
+The easiest download is the bundle, `hp_uploadprogress_guard-<version>.zip` (or `.tar.gz`, same content): every
+Linux `.so` and Windows DLL, the ini files, the source, `install_guard.sh` and an `INSTALL.txt` with the steps
+per platform, all covered by one `SHA256SUMS`. The single files are attached to the release as well, and are
+in `dist/` on `main`. Watch the repository with "Custom > Releases" to be notified of new versions.
 
 ### Build from source (any PHP, any flavour)
 
@@ -563,6 +565,9 @@ curl -fsSLO https://raw.githubusercontent.com/HOSTED-POWER/php_uploadprogress_gu
 less install_guard.sh
 sudo bash install_guard.sh --reload                       # or: --php 8.3, --ref <commit>, --remove
 ```
+
+Run from an unpacked release bundle, it installs the files next to it and downloads nothing (servers without
+internet access): `tar xzf hp_uploadprogress_guard-<version>.tar.gz && sudo bash hp_uploadprogress_guard-<version>/install_guard.sh --reload`.
 
 By hand, per version:
 

@@ -5,12 +5,15 @@
 #   sudo ./install_guard.sh                    every PHP version under /etc/php
 #   sudo ./install_guard.sh --php 7.4 --php 8.3
 #   sudo ./install_guard.sh --ref <tag|commit> install exactly the revision you audited (default: main)
+#   sudo ./install_guard.sh --online           download even when run from an unpacked release bundle
 #   sudo ./install_guard.sh --reload           also reload PHP-FPM and Apache (graceful, after a config test)
 #   sudo ./install_guard.sh --remove [--reload]
 #
 # Without --reload no running service is touched: the module is active for the CLI at once and for
 # PHP-FPM / Apache after their next reload, which the script prints. Re-running updates the module and
 # keeps an existing ini (and so any mode / allow_ips you set). Read it before running it as root.
+# Run from an unpacked release bundle (hp_uploadprogress_guard-X.Y.Z.zip / .tar.gz) it installs the files
+# next to it and downloads nothing; otherwise it downloads from GitHub at --ref.
 # Other layouts (cPanel EA4, DirectAdmin, RHEL, Windows): see the README.
 
 set -euo pipefail
@@ -18,6 +21,8 @@ set -euo pipefail
 REPO_RAW="https://raw.githubusercontent.com/HOSTED-POWER/php_uploadprogress_guard"
 NAME="hp_uploadprogress_guard"
 REF="main"
+REF_SET=0
+ONLINE=0
 RELOAD=0
 REMOVE=0
 VERSIONS=()
@@ -28,7 +33,8 @@ usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--php) [ $# -ge 2 ] || usage 1; VERSIONS+=("$2"); shift 2 ;;
-		--ref) [ $# -ge 2 ] || usage 1; REF="$2"; shift 2 ;;
+		--ref) [ $# -ge 2 ] || usage 1; REF="$2"; REF_SET=1; shift 2 ;;
+		--online) ONLINE=1; shift ;;
 		--reload) RELOAD=1; shift ;;
 		--remove) REMOVE=1; shift ;;
 		-h|--help) usage 0 ;;
@@ -144,14 +150,29 @@ esac
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
+# An unpacked release bundle has linux/, ini/ and SHA256SUMS next to this script: use those files.
+HERE=$(cd "$(dirname "$0")" && pwd)
+BUNDLE=""
+if [ "$ONLINE" -eq 0 ] && [ "$REF_SET" -eq 0 ] && [ -d "$HERE/linux" ] && [ -d "$HERE/ini" ] && [ -f "$HERE/SHA256SUMS" ]; then
+	BUNDLE="$HERE"
+fi
 fetch() { # fetch <repo path> <local file>
+	if [ -n "$BUNDLE" ]; then
+		case "$1" in
+			dist/SHA256SUMS) sed -n 's#^\([0-9a-f]\{64\}\)  linux/#\1  #p' "$BUNDLE/SHA256SUMS" > "$2"; [ -s "$2" ] ;;
+			dist/*) cp "$BUNDLE/linux/${1#dist/}" "$2" ;;
+			ansible/mods-available-*) cp "$BUNDLE/ini/${1#ansible/}" "$2" ;;
+			*) return 1 ;;
+		esac
+		return
+	fi
 	if command -v curl >/dev/null 2>&1; then curl -fsSL "$REPO_RAW/$REF/$1" -o "$2"
 	elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$REPO_RAW/$REF/$1"
 	else die "need curl or wget"; fi
 }
 fetch dist/SHA256SUMS "$WORK/SHA256SUMS" || die "cannot download dist/SHA256SUMS at ref '$REF'"
 fetch ansible/mods-available-$NAME.ini "$WORK/$NAME.ini" || die "cannot download the ini at ref '$REF'"
-echo "Source: $REPO_RAW/$REF ($(uname -m))"
+if [ -n "$BUNDLE" ]; then echo "Source: release bundle $BUNDLE ($(uname -m))"; else echo "Source: $REPO_RAW/$REF ($(uname -m))"; fi
 
 FAILED=0
 for v in "${VERSIONS[@]}"; do
