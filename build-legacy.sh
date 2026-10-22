@@ -22,7 +22,7 @@ for v in "$@"; do
       [ "$(uname -m)" = "'"$arch"'" ] || { echo "image is $(uname -m), wanted '"$arch"'"; exit 1; }
       cd /tmp && curl -fsSL "$URL" -o php.tar && { case "$URL" in *.xz) tar xJf php.tar ;; *) tar xjf php.tar ;; esac; } && cd php-5.* || exit 1
       # the GNU config.guess/config.sub shipped with PHP 5.x predate aarch64
-      curl -fsSL "https://git.savannah.gnu.org/cgit/config.git/plain/config.guess" -o config.guess && curl -fsSL "https://git.savannah.gnu.org/cgit/config.git/plain/config.sub" -o config.sub
+      for f in config.guess config.sub; do curl -fsSL "https://git.savannah.gnu.org/cgit/config.git/plain/$f" -o $f || curl -fsSL "https://raw.githubusercontent.com/gcc-mirror/gcc/master/$f" -o $f || { echo "no fresh $f"; exit 1; }; done
       ./configure --quiet --build="$(gcc -dumpmachine)" --prefix=/opt/php --disable-all --enable-session --enable-cgi --enable-cli >/tmp/cfg.log 2>&1 || { tail -5 /tmp/cfg.log; exit 1; }
       make -s -j"$(nproc)" >/tmp/mk.log 2>&1 || { grep error /tmp/mk.log | head -5; exit 1; }
       make -s install >/dev/null 2>&1; export PATH=/opt/php/bin:$PATH
