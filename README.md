@@ -1,6 +1,6 @@
 # hp_uploadprogress_guard
 
-**v3.2.3, 22 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
+**v3.2.4, 23 October 2026: two protections PHP itself does not ship yet.** Since the php2shell releases, two
 more problems have surfaced in current PHP. This module now covers both, on patched and unpatched PHP alike,
 so **keep it installed after you upgrade.**
 
@@ -31,7 +31,8 @@ applications on the host. Built by [Hosted Power](https://www.hosted-power.com) 
 published for everyone. PHP 5.4 through 8.5; Sury, Remi, cPanel EA4, DirectAdmin CustomBuild, official
 Docker images. **Prebuilt for Linux x86_64 and arm64 (aarch64), every branch from 5.4 to 8.5, and for
 Windows x64** (7.2 to 8.5, nts and ts), with checksums; one C source file for everything else. On a PHP that already carries the php2shell fix,
-vendor backports included, its php2shell layers notice that and step aside; the two protections above stay on.
+vendor backports included, its php2shell layers notice that and step aside; the two protections above stay on,
+and so does the detached session upload-progress handler (see point 4 below).
 
 **Install the official PHP release** (8.5.12, 8.4.27, 8.3.36, 8.2.35, and the PHP team's backports
 for 7.4, 8.0 and 8.1, which Sury extended down to 5.6); we recommend it without reservation. **This
@@ -174,6 +175,13 @@ module on unpatched engines.
   hp_uploadprogress_guard` shows `SimpleXML GC double-free workaround (php-src#24488) => active` on the
   affected releases and `not needed (this PHP release)` elsewhere.
 
+**v3.2.4** (23 October): status and documentation fixes reported in #17, #18 and #19, no change in what
+is protected. phpinfo's `mbstring.encoding_translation requests` row now follows the setting instead of
+only whether mbstring is loaded (#19). When an extension loaded before this one already cleared the session
+upload-progress handler, `session.upload_progress.enabled` is now forced to `0` and locked as when the
+module detaches it itself (#18). The README now states that the upload-progress detach stays on on patched
+PHP, by design (#17).
+
 **v3.2.3** (22 October, evening): thread-safe SAPIs ran PHP's parser, not ours. PHP keeps the table of
 POST handlers in per-thread SAPI globals, and every new thread starts from PHP's default entries. The
 module registered its multipart handler once, at startup, so on a thread-safe build with a threaded SAPI
@@ -238,7 +246,13 @@ Three things happen at process start. None of them is visible to an application:
    8.3.36, 8.2.35 or later) and, since v3.1.0, looks for the symbols only a fixed engine exports, which
    also recognises vendor backports that keep their version number. On such an engine it leaves PHP's
    own parser in place and switches its v3.1 mechanisms off. One deployment covers patched and
-   unpatched hosts, and nothing has to be undone after the upgrade.
+   unpatched hosts, and nothing has to be undone after the upgrade. **The upload-progress detach stays on
+   by design:** the session upload-progress handler writes request data into the session from HTTP alone,
+   the route the published attack used, and no PHP release needs it to be on. So on a patched engine too,
+   `session.upload_progress.enabled` reads `0` and is locked. Hosts that rely on upload progress set
+   `hp_uploadprogress_guard.detach_upload_progress = 0`. Since v3.2.4 the same holds when another
+   extension loaded earlier already cleared the handler: the ini is forced to `0` and locked as well, and
+   phpinfo says so.
 5. **Nested `unserialize()` calls cannot reach freed memory** (since v3.2.0, on every engine, patched or
    not). A nested `unserialize()` or `session_decode()` from a destructor, a generator or anything else
    outside PHP's `Serializable` nesting runs with its own state, so it cannot work on the bookkeeping

@@ -103,7 +103,7 @@ extern void hp_upg_sym_delayed_oom(void) __asm__("zend_handle_delayed_oom") __at
 extern void hp_upg_sym_safe_error_ex(void) __asm__("zend_mm_safe_error_ex") __attribute__((weak));
 #endif
 
-#define HP_MPG_VERSION "3.2.3"
+#define HP_MPG_VERSION "3.2.4"
 #define HP_MPG_NAME "hp_uploadprogress_guard"
 
 /* thread-safe (ZTS) builds, PHP 7+: per-thread globals cache (no-op on NTS) */
@@ -513,6 +513,11 @@ static void hp_upg_force_ini_off(void)
 	hp_upg_ini_forced = 1;
 }
 static int hp_upg_mbstring = 0;
+#if PHP_VERSION_ID < 70000
+#define HP_UPG_MODULE_LOADED(name) zend_hash_exists(&module_registry, name, sizeof(name))
+#else
+#define HP_UPG_MODULE_LOADED(name) zend_hash_str_exists(&module_registry, name, sizeof(name) - 1)
+#endif
 static char hp_upg_php_version[32] = "";
 
 /* First PHP release of each branch that contains the official fix; any branch newer than the last entry
@@ -945,11 +950,7 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 #ifdef HP_UPG_TEST_FORCE_PARSE
 	hp_upg_php_patched = 0; /* test builds only: exercise the carried parser on a patched engine */
 #endif
-#if PHP_VERSION_ID < 70000
-	hp_upg_mbstring = zend_hash_exists(&module_registry, "mbstring", sizeof("mbstring"));
-#else
-	hp_upg_mbstring = zend_hash_str_exists(&module_registry, "mbstring", sizeof("mbstring") - 1);
-#endif
+	hp_upg_mbstring = HP_UPG_MODULE_LOADED("mbstring");
 	{
 		const char *mode = INI_STR("hp_uploadprogress_guard.mode");
 		/* native: never replace. parse on a PHP that already carries the fix: step aside too. */
@@ -958,9 +959,15 @@ static PHP_MINIT_FUNCTION(hp_uploadprogress_guard)
 			HP_UPG_G(entry_installed) = hp_upg_install_entry(HP_UPG_TSRMLS_C);
 		}
 	}
-	if (INI_BOOL("hp_uploadprogress_guard.detach_upload_progress") && php_rfc1867_callback != NULL) {
-		php_rfc1867_callback = NULL;
-		hp_upg_detached = 1;
+	if (INI_BOOL("hp_uploadprogress_guard.detach_upload_progress")) {
+		if (php_rfc1867_callback != NULL) {
+			php_rfc1867_callback = NULL;
+			hp_upg_detached = 1;
+		} else if (HP_UPG_MODULE_LOADED("session")) {
+			/* ext/session starts before this module (declared dependency) and installs its callback in its
+			 * MINIT: if it is gone, an extension loaded earlier cleared it. Same state, same ini lock. */
+			hp_upg_detached = 2;
+		}
 	}
 	if (hp_upg_detached) {
 		hp_upg_force_ini_off();
@@ -1017,13 +1024,17 @@ static PHP_MINFO_FUNCTION(hp_uploadprogress_guard)
 		: (hp_upg_want_install ? "no (another extension installed its own handler in this thread, see README)" : "no"));
 	php_info_print_table_row(2, "mode", INI_STR("hp_uploadprogress_guard.mode"));
 	php_info_print_table_row(2, "parser memory-headroom guard", live ? (PG(memory_limit) > 0 ? "yes" : "not needed (memory_limit unlimited)") : "no (parser not replaced)");
-	php_info_print_table_row(2, "mbstring.encoding_translation requests", live ? (hp_upg_mbstring ? "handed to PHP's parser" : "n/a (mbstring not loaded)") : "n/a");
+	/* the setting is PHP_INI_PERDIR: read it now, as the request path does (hp_upg_native_needed) */
+	php_info_print_table_row(2, "mbstring.encoding_translation requests", live ? (hp_upg_mbstring
+		? (INI_INT("mbstring.encoding_translation") ? "handed to PHP's parser (mbstring.encoding_translation is On)" : "module's parser (mbstring.encoding_translation is Off)")
+		: "n/a (mbstring not loaded)") : "n/a");
 	php_info_print_table_row(2, "running PHP already carries the official fix", hp_upg_php_patched
 		? (hp_upg_fix_probed
 			? (live ? "yes (fix symbol exported by the engine)" : "yes (fix symbol exported by the engine; parser replacement skipped)")
 			: (live ? "yes" : "yes (parser replacement skipped)"))
 		: "no");
-	php_info_print_table_row(2, "session.upload_progress handler detached", hp_upg_detached ? "yes" : "no");
+	php_info_print_table_row(2, "session.upload_progress handler detached", hp_upg_detached == 1 ? "yes"
+		: (hp_upg_detached == 2 ? "yes (already cleared by an extension loaded earlier)" : "no"));
 	php_info_print_table_row(2, "session.upload_progress.enabled forced to 0 and locked (PHP_INI_SYSTEM)", hp_upg_ini_forced ? "yes" : "no");
 	php_info_print_table_row(2, "out-of-memory exit (_exit(137) while no script is executing)", hp_upg_oom_hook_active ? "active" : (hp_upg_php_patched ? "not needed (engine carries the fix)" : "inactive"));
 	php_info_print_table_row(2, "stale request state cleared at request end (handlers, superglobals, request_info)", hp_upg_php_patched ? "not needed (engine carries the fix)" : (hp_upg_sapi_wrapped ? "active" : "inactive"));
